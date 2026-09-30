@@ -1573,3 +1573,305 @@ Group ထဲမှာ ဒီလိုရိုက်ပါ -
 ⏰ Schedule မစခင်
 <b>15 minutes</b> ကြို Reminder ပေးပါမယ်။
 """,
+            parse_mode="HTML",
+        )
+
+    elif data == "myschedule":
+
+        fake_update = update
+
+        await my_schedule_command(
+            fake_update,
+            context,
+        )
+
+    elif data == "admins":
+
+        await admins_command(
+            update,
+            context,
+        )
+
+    elif data == "report":
+
+        await report_command(
+            update,
+            context,
+        )
+
+    elif data == "help":
+
+        await query.message.reply_text(
+            """
+╔══ ℹ️ <b>HELP</b> ══╗
+
+🗓 Add Schedule:
+<code>Today 1:30-3:00 day</code>
+
+🌙 Tomorrow:
+<code>Tomorrow 8:00-12:00 night</code>
+
+📋 /myschedule
+👑 /admins
+📊 /report
+❌ /cancelschedule
+🆔 /groupid
+🛡 /checkadmin
+""",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("cancel:"):
+
+        schedule_id = int(
+            data.split(":")[1]
+        )
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            DELETE FROM schedules
+            WHERE id = ?
+        """, (schedule_id,))
+
+        conn.commit()
+        conn.close()
+
+        await query.message.reply_text(
+            "✅ Schedule cancelled."
+        )
+
+
+# =========================================================
+# MEMBER TRACKING
+# =========================================================
+
+async def member_update_handler(
+    update,
+    context,
+):
+    chat_member = update.chat_member
+
+    if not chat_member:
+        return
+
+    chat = chat_member.chat
+
+    save_group(chat)
+
+    user = chat_member.new_chat_member.user
+
+    save_user(user)
+
+
+# =========================================================
+# CLEANUP
+# =========================================================
+
+async def cleanup_job(
+    context,
+):
+    today = datetime.now(TZ).date()
+
+    old_date = (
+        today - timedelta(days=30)
+    ).isoformat()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM schedules
+        WHERE date < ?
+    """, (old_date,))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# POST INIT
+# =========================================================
+
+async def post_init(
+    application,
+):
+    global current_application
+
+    current_application = application
+
+    await restore_jobs(
+        application
+    )
+
+    application.job_queue.run_repeating(
+        cleanup_job,
+        interval=86400,
+        first=60,
+        name="cleanup",
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing."
+        )
+
+    init_db()
+
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    # -------------------------------
+    # COMMANDS
+    # -------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "today",
+            today_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tomorrow",
+            tomorrow_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "schedule",
+            schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myschedule",
+            my_schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "admins",
+            admins_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "report",
+            report_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancelschedule",
+            cancel_schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "addadmin",
+            add_admin_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "removeadmin",
+            remove_admin_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "groupid",
+            group_id_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "checkadmin",
+            check_admin_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast_command,
+        )
+    )
+
+    # -------------------------------
+    # BUTTONS
+    # -------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    # -------------------------------
+    # RAW SCHEDULE TEXT
+    # -------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            schedule_text_handler,
+        )
+    )
+
+    # -------------------------------
+    # MEMBER TRACKING
+    # -------------------------------
+
+    application.add_handler(
+        ChatMemberHandler(
+            member_update_handler,
+            ChatMemberHandler.CHAT_MEMBER,
+        )
+    )
+
+    print(
+        "🤖 Group Admin Management Bot is running..."
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+    main()
