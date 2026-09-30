@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, date, timedelta, time
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -10,53 +10,41 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatType
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
     ChatMemberHandler,
-    filters,
+    CommandHandler,
+    ContextTypes,
 )
 
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Myanmar Time
 TZ = ZoneInfo("Asia/Yangon")
-
 REMINDER_MINUTES = 15
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
+# =========================================================
 # DATABASE
-# ============================================================
+# =========================================================
 
 def get_db():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-    )
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -70,7 +58,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             full_name TEXT,
-            started_at TEXT
+            first_seen TEXT
         )
     """)
 
@@ -78,7 +66,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS groups (
             chat_id INTEGER PRIMARY KEY,
             title TEXT,
-            owner_id INTEGER,
+            chat_type TEXT,
             created_at TEXT
         )
     """)
@@ -87,10 +75,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS group_admins (
             chat_id INTEGER,
             user_id INTEGER,
-            role TEXT DEFAULT 'admin',
-            note TEXT DEFAULT '',
             added_at TEXT,
-            PRIMARY KEY (chat_id, user_id)
+            PRIMARY KEY(chat_id, user_id)
         )
     """)
 
@@ -98,12 +84,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS schedules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
-            admin_id INTEGER,
-            schedule_date TEXT,
-            start_time TEXT,
-            end_time TEXT,
+            user_id INTEGER,
+            start_at TEXT,
+            end_at TEXT,
             shift TEXT,
-            note TEXT DEFAULT '',
+            note TEXT,
             created_at TEXT
         )
     """)
@@ -112,8 +97,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             schedule_id INTEGER,
-            admin_id INTEGER,
-            chat_id INTEGER,
+            user_id INTEGER,
             status TEXT,
             checked_at TEXT
         )
@@ -124,10 +108,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             user_id INTEGER,
-            username TEXT,
-            full_name TEXT,
             event TEXT,
-            created_at TEXT
+            event_at TEXT
         )
     """)
 
@@ -135,611 +117,847 @@ def init_db():
     conn.close()
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now_local():
+def now():
     return datetime.now(TZ)
 
 
-def now_iso():
-    return now_local().isoformat()
+def to_iso(dt):
+    return dt.astimezone(TZ).isoformat()
 
 
-def today_local():
-    return now_local().date()
+# =========================================================
+# SAVE USER / GROUP
+# =========================================================
 
-
-def format_date(d):
-    return d.strftime("%d %b %Y")
-
-
-def format_time(t):
-    return t.strftime("%I:%M %p").lstrip("0")
-
-
-def user_display(user):
-    if not user:
-        return "Unknown"
-
-    if user.username:
-        return f"@{user.username}"
-
-    return user.full_name or str(user.id)
-
-
-def register_user(user):
+def save_user(user):
     if not user:
         return
 
     conn = get_db()
 
     conn.execute("""
-        INSERT OR REPLACE INTO users
-        (
-            user_id,
-            username,
-            full_name,
-            started_at
-        )
+        INSERT INTO users
+        (user_id, username, full_name, first_seen)
         VALUES (?, ?, ?, ?)
+
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name
     """, (
         user.id,
         user.username or "",
         user.full_name or "",
-        now_iso(),
+        to_iso(now()),
     ))
 
     conn.commit()
     conn.close()
 
 
-def register_group(chat_id, title):
+def save_group(chat):
+    if not chat:
+        return
+
     conn = get_db()
 
     conn.execute("""
-        INSERT OR IGNORE INTO groups
-        (
-            chat_id,
-            title,
-            owner_id,
-            created_at
-        )
+        INSERT INTO groups
+        (chat_id, title, chat_type, created_at)
         VALUES (?, ?, ?, ?)
-    """, (
-        chat_id,
-        title or "Unknown Group",
-        None,
-        now_iso(),
-    ))
 
-    conn.execute("""
-        UPDATE groups
-        SET title = ?
-        WHERE chat_id = ?
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+            title = excluded.title,
+            chat_type = excluded.chat_type
     """, (
-        title or "Unknown Group",
-        chat_id,
+        chat.id,
+        chat.title or "",
+        chat.type,
+        to_iso(now()),
     ))
 
     conn.commit()
     conn.close()
 
 
-# ============================================================
+# =========================================================
+# PREMIUM MENU
+# =========================================================
+
+async def get_menu():
+    bot = await current_application.bot.get_me()
+    username = bot.username
+
+    group_url = f"https://t.me/{username}?startgroup=true"
+    channel_url = f"https://t.me/{username}?startchannel=true"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✦ TODAY",
+                callback_data="today"
+            ),
+            InlineKeyboardButton(
+                "✦ TOMORROW",
+                callback_data="tomorrow"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "＋ ADD SCHEDULE",
+                callback_data="add_schedule"
+            ),
+            InlineKeyboardButton(
+                "◈ MY SCHEDULE",
+                callback_data="my_schedule"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "♛ ADMINS",
+                callback_data="admins"
+            ),
+            InlineKeyboardButton(
+                "▣ REPORTS",
+                callback_data="report"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "＋ ADD GROUP",
+                url=group_url
+            ),
+            InlineKeyboardButton(
+                "＋ ADD CHANNEL",
+                url=channel_url
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "❔ HELP",
+                callback_data="help"
+            ),
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# START MESSAGE
+# =========================================================
+
+def welcome_text(chat_title):
+    return (
+        "╔════════════════════════════╗\n"
+        "        ✦ GROUP ADMIN HUB ✦\n"
+        "╚════════════════════════════╝\n\n"
+
+        f"▸ <b>{chat_title}</b>\n\n"
+
+        "<blockquote>"
+        "Premium Admin Management System\n\n"
+        "• Admin Schedule\n"
+        "• 15-Minute Reminder\n"
+        "• Start / End Notification\n"
+        "• Admin List\n"
+        "• Daily Reports\n"
+        "• Member Tracking\n"
+        "• Multi-Group Support"
+        "</blockquote>\n\n"
+
+        "Choose an option below."
+    )
+
+
+# =========================================================
 # ADMIN CHECK
-# ============================================================
+# =========================================================
 
-async def is_group_admin(
-    context,
-    chat_id,
-    user_id,
-):
-    try:
-        member = await context.bot.get_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-        )
+async def is_admin(update, user_id=None):
 
-        return member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
+    chat = update.effective_chat
 
-    except Exception as e:
-        logger.warning(
-            "Admin check failed: %s",
-            e,
-        )
+    if not chat:
         return False
 
+    if user_id is None:
+        user_id = update.effective_user.id
 
-async def is_group_owner(
-    context,
-    chat_id,
-    user_id,
-):
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-        )
+        member = await chat.get_member(user_id)
 
-        return member.status == ChatMemberStatus.OWNER
+        return member.status in (
+            "administrator",
+            "creator",
+            "owner",
+        )
 
     except Exception:
         return False
 
 
-async def require_group_admin(
-    update,
-    context,
-):
-    chat = update.effective_chat
-    user = update.effective_user
+async def require_admin(update):
 
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
-        await update.message.reply_text(
-            "❌ ဒီ command ကို Group ထဲမှာ အသုံးပြုပါ။"
+    if await is_admin(update):
+        return True
+
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "⛔ <b>Admin Only</b>\n\n"
+            "ဒီလုပ်ဆောင်ချက်ကို Group Admin တွေပဲ အသုံးပြုနိုင်ပါတယ်။",
+            parse_mode="HTML",
         )
-        return False
 
-    if not await is_group_admin(
-        context,
-        chat.id,
-        user.id,
-    ):
-        await update.message.reply_text(
-            "⛔ ဒီလုပ်ဆောင်ချက်ကို Group Admin တွေပဲ အသုံးပြုနိုင်ပါတယ်။"
-        )
-        return False
-
-    register_group(
-        chat.id,
-        chat.title,
-    )
-
-    return True
+    return False
 
 
-# ============================================================
-# PREMIUM KEYBOARD
-# ============================================================
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "✦ TODAY",
-                callback_data="today",
-            ),
-            InlineKeyboardButton(
-                "✦ TOMORROW",
-                callback_data="tomorrow",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "＋ ADD SCHEDULE",
-                callback_data="add",
-            ),
-            InlineKeyboardButton(
-                "◈ MY SCHEDULE",
-                callback_data="mine",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "♛ ADMINS",
-                callback_data="admins",
-            ),
-            InlineKeyboardButton(
-                "▣ REPORTS",
-                callback_data="reports",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⚙ SETTINGS",
-                callback_data="settings",
-            ),
-            InlineKeyboardButton(
-                "❔ HELP",
-                callback_data="help",
-            ),
-        ],
-    ])
-
-
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "‹ BACK",
-                callback_data="home",
-            )
-        ]
-    ])
-
-
-# ============================================================
-# PREMIUM TEXT
-# ============================================================
-
-def welcome_text(group_name):
-    return (
-        f"╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        f"       ✦ **{group_name}** ✦\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        f"> **ADMIN MANAGEMENT CENTER**\n\n"
-        f"Welcome 👋\n"
-        f"ဒီ Bot က Group Admin တွေရဲ့\n\n"
-        f"  ◈ 🗓️ Schedule\n"
-        f"  ◈ ⏰ Duty Time\n"
-        f"  ◈ 🔔 Reminder\n"
-        f"  ◈ 👤 Attendance\n"
-        f"  ◈ 👥 Member Activity\n"
-        f"  ◈ 📊 Reports\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"**Quick Action**\n"
-        f"အောက်က Menu ကနေ ရွေးချယ်ပါ။"
-    )
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    user = update.effective_user
-    register_user(user)
-
-    chat = update.effective_chat
-
-    if chat.type in (
-        "group",
-        "supergroup",
-    ):
-        register_group(
-            chat.id,
-            chat.title,
-        )
-        group_name = chat.title or "THIS GROUP"
-    else:
-        group_name = "LUXURY NEXUS"
-
-    await update.message.reply_text(
-        welcome_text(group_name),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ============================================================
+# =========================================================
 # TIME PARSER
-# ============================================================
+# =========================================================
 
-def parse_one_time(value):
-    value = value.strip().upper()
+def convert_time(hour, minute, shift):
 
-    formats = [
-        "%H:%M",
-        "%H",
-        "%I:%M %p",
-        "%I %p",
-    ]
+    hour = int(hour)
+    minute = int(minute)
 
-    for fmt in formats:
-        try:
-            return datetime.strptime(
-                value,
-                fmt,
-            ).time()
-        except ValueError:
-            pass
+    if hour > 23 or minute > 59:
+        raise ValueError("Invalid time.")
 
-    return None
+    shift = shift.lower()
 
+    # DAY
+    if shift == "day":
 
-def parse_time_range(text):
-    text = text.strip()
+        # 1:00 -> 13:00
+        if hour < 8:
+            hour += 12
 
-    parts = re.split(
-        r"\s*-\s*",
-        text,
-        maxsplit=1,
-    )
+    # NIGHT
+    elif shift == "night":
 
-    if len(parts) != 2:
-        return None
+        # 8:00 -> 20:00
+        if 1 <= hour <= 11:
+            hour += 12
 
-    start = parse_one_time(parts[0])
-    end = parse_one_time(parts[1])
+        # 12:00 -> 00:00
+        elif hour == 12:
+            hour = 0
 
-    if not start or not end:
-        return None
-
-    return start, end
+    return time(hour, minute)
 
 
-# ============================================================
-# SCHEDULE INPUT
-# ============================================================
+def parse_schedule(text):
 
-async def handle_schedule_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if update.effective_chat.type != "private":
-        return
-
-    user = update.effective_user
-
-    register_user(user)
-
-    text = update.message.text.strip()
-
-    pattern = (
-        r"^(today|tomorrow)"
-        r"\s+(.+?)"
-        r"\s+(day|night)"
-        r"(?:\s+(.+))?$"
-    )
-
-    match = re.match(
-        pattern,
-        text,
+    pattern = re.compile(
+        r"^(today|tomorrow)\s+"
+        r"(\d{1,2}):(\d{2})"
+        r"\s*-\s*"
+        r"(\d{1,2})(?::(\d{2}))?"
+        r"\s+"
+        r"(day|night)"
+        r"(?:\s*\|\s*(.*))?$",
         re.IGNORECASE,
     )
 
+    match = pattern.match(text.strip())
+
     if not match:
-        return
+        raise ValueError(
+            "Format မှားနေပါတယ်။\n\n"
+            "ဥပမာ:\n"
+            "Today 12:15-1:00 day\n"
+            "Tomorrow 8:00-12:00 night\n\n"
+            "Note ပါချင်ရင်:\n"
+            "Today 12:15-1:00 day | meeting"
+        )
 
     day_word = match.group(1).lower()
-    time_text = match.group(2)
-    shift = match.group(3).lower()
-    note = match.group(4) or ""
 
-    parsed = parse_time_range(
-        time_text
+    start_hour = match.group(2)
+    start_minute = match.group(3)
+
+    end_hour = match.group(4)
+    end_minute = match.group(5) or "00"
+
+    shift = match.group(6).lower()
+    note = match.group(7) or ""
+
+    start_time = convert_time(
+        start_hour,
+        start_minute,
+        shift,
     )
 
-    if not parsed:
-        await update.message.reply_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ⚠️ **INVALID TIME**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "ဒီလို format နဲ့ ပို့ပါ 👇\n\n"
-            "> `Today 12:15-1:00 day`\n"
-            "> `Tomorrow 8:00-12:00 night`\n\n"
-            "24-hour format လည်းရပါတယ်။"
-        )
-        return
-
-    start_t, end_t = parsed
-
-    groups = await get_user_groups(
-        context,
-        user.id,
+    end_time = convert_time(
+        end_hour,
+        end_minute,
+        shift,
     )
 
-    if not groups:
-        await update.message.reply_text(
-            "⛔ **ADMIN GROUP မတွေ့ပါဘူး။**\n\n"
-            "Bot ကို Group ထဲမှာ Admin အဖြစ်ထည့်ပြီး\n"
-            "`/checkadmin` ကို တစ်ခါ run လုပ်ပါ။",
-            parse_mode="Markdown",
-        )
-        return
+    base_date = now().date()
 
-    if day_word == "today":
-        target_date = today_local()
-    else:
-        target_date = today_local() + timedelta(days=1)
+    if day_word == "tomorrow":
+        base_date += timedelta(days=1)
 
-    if len(groups) == 1:
-
-        group = groups[0]
-
-        schedule_id = save_schedule(
-            group["chat_id"],
-            user.id,
-            target_date,
-            start_t,
-            end_t,
-            shift,
-            note,
-        )
-
-        await schedule_jobs(
-            context,
-            schedule_id,
-        )
-
-        await update.message.reply_text(
-            schedule_saved_text(
-                group["title"],
-                user,
-                target_date,
-                start_t,
-                end_t,
-                shift,
-                note,
-            ),
-            parse_mode="Markdown",
-        )
-
-        return
-
-    context.user_data["pending_schedule"] = {
-        "admin_id": user.id,
-        "day": day_word,
-        "start": start_t.strftime("%H:%M"),
-        "end": end_t.strftime("%H:%M"),
-        "shift": shift,
-        "note": note,
-    }
-
-    buttons = []
-
-    for group in groups:
-        buttons.append([
-            InlineKeyboardButton(
-                f"⌂ {group['title'][:45]}",
-                callback_data=f"sg:{group['chat_id']}",
-            )
-        ])
-
-    await update.message.reply_text(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "       ⌂ **SELECT GROUP**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "ဒီ Schedule ကို ဘယ် Group အတွက် မှတ်မလဲ?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    start_dt = datetime.combine(
+        base_date,
+        start_time,
+        tzinfo=TZ,
     )
 
+    end_dt = datetime.combine(
+        base_date,
+        end_time,
+        tzinfo=TZ,
+    )
 
-def schedule_saved_text(
-    group_title,
-    user,
-    target_date,
-    start_t,
-    end_t,
-    shift,
-    note,
-):
-
-    shift_icon = "☀️" if shift == "day" else "🌙"
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
 
     return (
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "       ✦ **SCHEDULE SAVED**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        f"> **GROUP**\n"
-        f"> {group_title}\n\n"
-        f"👤 **ADMIN**\n"
-        f"{user.full_name}\n\n"
-        f"🗓️ **DATE**\n"
-        f"{format_date(target_date)}\n\n"
-        f"⏰ **DUTY TIME**\n"
-        f"{start_t.strftime('%I:%M %p').lstrip('0')} "
-        f"→ "
-        f"{end_t.strftime('%I:%M %p').lstrip('0')}\n\n"
-        f"{shift_icon} **{shift.upper()} SHIFT**\n\n"
-        f"📝 **NOTE**\n"
-        f"{note or '—'}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔔 **Reminder: 15 minutes before**"
+        start_dt,
+        end_dt,
+        shift,
+        note.strip(),
     )
 
 
-# ============================================================
-# SAVE SCHEDULE
-# ============================================================
+# =========================================================
+# SCHEDULE JOBS
+# =========================================================
 
-def save_schedule(
-    chat_id,
-    admin_id,
-    schedule_date,
-    start_t,
-    end_t,
-    shift,
-    note="",
+def job_name(prefix, schedule_id):
+    return f"{prefix}_{schedule_id}"
+
+
+def remove_schedule_jobs(app, schedule_id):
+
+    for prefix in (
+        "reminder",
+        "start",
+        "end",
+    ):
+
+        jobs = app.job_queue.get_jobs_by_name(
+            job_name(prefix, schedule_id)
+        )
+
+        for job in jobs:
+            job.schedule_removal()
+
+
+def create_schedule_jobs(app, row):
+
+    start_dt = datetime.fromisoformat(
+        row["start_at"]
+    ).astimezone(TZ)
+
+    end_dt = datetime.fromisoformat(
+        row["end_at"]
+    ).astimezone(TZ)
+
+    current = now()
+
+    reminder_time = (
+        start_dt -
+        timedelta(minutes=REMINDER_MINUTES)
+    )
+
+    if reminder_time > current:
+
+        app.job_queue.run_once(
+            reminder_job,
+            when=reminder_time,
+            data={
+                "schedule_id": row["id"]
+            },
+            name=job_name(
+                "reminder",
+                row["id"]
+            ),
+        )
+
+    if start_dt > current:
+
+        app.job_queue.run_once(
+            start_job,
+            when=start_dt,
+            data={
+                "schedule_id": row["id"]
+            },
+            name=job_name(
+                "start",
+                row["id"]
+            ),
+        )
+
+    if end_dt > current:
+
+        app.job_queue.run_once(
+            end_job,
+            when=end_dt,
+            data={
+                "schedule_id": row["id"]
+            },
+            name=job_name(
+                "end",
+                row["id"]
+            ),
+        )
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
+
+async def send_notification(
+    context,
+    schedule_id,
+    notification_type,
 ):
 
     conn = get_db()
 
-    cur = conn.cursor()
+    row = conn.execute("""
+        SELECT *
+        FROM schedules
+        WHERE id = ?
+    """, (schedule_id,)).fetchone()
 
-    cur.execute("""
-        INSERT INTO schedules
-        (
-            chat_id,
-            admin_id,
-            schedule_date,
-            start_time,
-            end_time,
-            shift,
-            note,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        chat_id,
-        admin_id,
-        schedule_date.isoformat(),
-        start_t.strftime("%H:%M"),
-        end_t.strftime("%H:%M"),
-        shift,
-        note,
-        now_iso(),
-    ))
+    if not row:
+        conn.close()
+        return
 
-    schedule_id = cur.lastrowid
+    user = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+    """, (row["user_id"],)).fetchone()
 
-    conn.commit()
     conn.close()
 
-    return schedule_id
+    name = (
+        user["full_name"]
+        if user
+        else str(row["user_id"])
+    )
+
+    start_dt = datetime.fromisoformat(
+        row["start_at"]
+    ).astimezone(TZ)
+
+    end_dt = datetime.fromisoformat(
+        row["end_at"]
+    ).astimezone(TZ)
+
+    time_text = (
+        f"{start_dt.strftime('%I:%M %p')}"
+        f" – "
+        f"{end_dt.strftime('%I:%M %p')}"
+    )
+
+    if notification_type == "reminder":
+
+        title = "⏰ SHIFT REMINDER"
+
+        message = (
+            f"Admin <b>{name}</b>\n\n"
+            f"Your shift starts in "
+            f"<b>{REMINDER_MINUTES} minutes</b>."
+        )
+
+    elif notification_type == "start":
+
+        title = "🔔 SHIFT STARTED"
+
+        message = (
+            f"Admin <b>{name}</b>\n\n"
+            "Your scheduled shift has started."
+        )
+
+    else:
+
+        title = "🏁 SHIFT ENDED"
+
+        message = (
+            f"Admin <b>{name}</b>\n\n"
+            "Your scheduled shift has ended."
+        )
+
+    text = (
+        f"╔══ {title} ══╗\n\n"
+        f"{message}\n\n"
+        f"🕐 {time_text}\n"
+        f"🌙 {row['shift'].upper()}"
+    )
+
+    if row["note"]:
+        text += (
+            f"\n📝 {row['note']}"
+        )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=row["chat_id"],
+            text=text,
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Notification failed: %s",
+            e
+        )
+
+    if notification_type == "start":
+
+        conn = get_db()
+
+        conn.execute("""
+            INSERT INTO attendance
+            (schedule_id, user_id, status, checked_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            schedule_id,
+            row["user_id"],
+            "started",
+            to_iso(now()),
+        ))
+
+        conn.commit()
+        conn.close()
 
 
-# ============================================================
-# GET USER GROUPS
-# ============================================================
+async def reminder_job(context):
+    await send_notification(
+        context,
+        context.job.data["schedule_id"],
+        "reminder",
+    )
 
-async def get_user_groups(
-    context,
-    user_id,
-):
+
+async def start_job(context):
+    await send_notification(
+        context,
+        context.job.data["schedule_id"],
+        "start",
+    )
+
+
+async def end_job(context):
+    await send_notification(
+        context,
+        context.job.data["schedule_id"],
+        "end",
+    )
+
+
+# =========================================================
+# RESTORE JOBS AFTER RESTART
+# =========================================================
+
+async def restore_jobs(app):
 
     conn = get_db()
 
     rows = conn.execute("""
-        SELECT chat_id, title
-        FROM groups
-        ORDER BY title
-    """).fetchall()
+        SELECT *
+        FROM schedules
+        WHERE end_at > ?
+        ORDER BY start_at
+    """, (
+        to_iso(now()),
+    )).fetchall()
 
     conn.close()
 
-    result = []
-
     for row in rows:
+        create_schedule_jobs(
+            app,
+            row,
+        )
 
-        if await is_group_admin(
-            context,
-            row["chat_id"],
-            user_id,
-        ):
-            result.append(row)
-
-    return result
+    logger.info(
+        "Restored %s schedule(s).",
+        len(rows),
+    )
 
 
-# ============================================================
-# SCHEDULE JOBS
-# ============================================================
+# =========================================================
+# START
+# =========================================================
 
-async def schedule_jobs(
+async def start_command(
+    update,
     context,
-    schedule_id,
 ):
 
+    save_user(
+        update.effective_user
+    )
+
+    chat = update.effective_chat
+
+    if chat.type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+        ChatType.CHANNEL,
+    ):
+        save_group(chat)
+
+    menu = await get_menu()
+
+    await update.message.reply_text(
+        welcome_text(
+            chat.title
+            or "Group Admin Hub"
+        ),
+        parse_mode="HTML",
+        reply_markup=menu,
+    )
+
+
+# =========================================================
+# TODAY
+# =========================================================
+
+async def show_day(
+    update,
+    day,
+):
+
+    chat_id = update.effective_chat.id
+
+    start = datetime.combine(
+        day,
+        time.min,
+        tzinfo=TZ,
+    )
+
+    end = start + timedelta(days=1)
+
     conn = get_db()
+
+    rows = conn.execute("""
+        SELECT
+            schedules.*,
+            users.username,
+            users.full_name
+
+        FROM schedules
+
+        LEFT JOIN users
+        ON users.user_id = schedules.user_id
+
+        WHERE schedules.chat_id = ?
+        AND schedules.start_at >= ?
+        AND schedules.start_at < ?
+
+        ORDER BY schedules.start_at
+    """, (
+        chat_id,
+        to_iso(start),
+        to_iso(end),
+    )).fetchall()
+
+    conn.close()
+
+    title = (
+        "TODAY"
+        if day == now().date()
+        else "TOMORROW"
+    )
+
+    if not rows:
+
+        text = (
+            f"╔══ ✦ {title} SCHEDULE ✦ ══╗\n\n"
+            "No schedule found.\n\n"
+            "＋ ADD SCHEDULE ကိုနှိပ်ပြီး "
+            "Schedule ထည့်နိုင်ပါတယ်။"
+        )
+
+    else:
+
+        lines = [
+            f"╔══ ✦ {title} SCHEDULE ✦ ══╗",
+            "",
+        ]
+
+        for index, row in enumerate(
+            rows,
+            1,
+        ):
+
+            start_dt = datetime.fromisoformat(
+                row["start_at"]
+            ).astimezone(TZ)
+
+            end_dt = datetime.fromisoformat(
+                row["end_at"]
+            ).astimezone(TZ)
+
+            username = (
+                f"@{row['username']}"
+                if row["username"]
+                else row["full_name"]
+            )
+
+            lines.append(
+                f"<b>{index}. "
+                f"{start_dt.strftime('%I:%M %p')} – "
+                f"{end_dt.strftime('%I:%M %p')}</b>"
+            )
+
+            lines.append(
+                f"👤 {username}"
+            )
+
+            lines.append(
+                f"🌙 {row['shift'].upper()}"
+            )
+
+            if row["note"]:
+                lines.append(
+                    f"📝 {row['note']}"
+                )
+
+            lines.append("")
+
+        text = "\n".join(lines)
+
+    menu = await get_menu()
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=menu,
+    )
+
+
+async def today_command(
+    update,
+    context,
+):
+
+    if update.effective_chat.type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        save_group(
+            update.effective_chat
+        )
+
+    await show_day(
+        update,
+        now().date(),
+    )
+
+
+async def tomorrow_command(
+    update,
+    context,
+):
+
+    if update.effective_chat.type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        save_group(
+            update.effective_chat
+        )
+
+    await show_day(
+        update,
+        now().date()
+        + timedelta(days=1),
+    )
+
+
+# =========================================================
+# ADD SCHEDULE
+# =========================================================
+
+async def schedule_command(
+    update,
+    context,
+):
+
+    if not await require_admin(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "＋ <b>ADD SCHEDULE</b>\n\n"
+            "အသုံးပြုပုံ:\n\n"
+            "<code>Today 12:15-1:00 day</code>\n"
+            "<code>Tomorrow 8:00-12:00 night</code>\n\n"
+            "Note ပါချင်ရင်:\n"
+            "<code>Today 12:15-1:00 day | meeting</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    schedule_text = " ".join(
+        context.args
+    )
+
+    try:
+
+        start_dt, end_dt, shift, note = (
+            parse_schedule(schedule_text)
+        )
+
+    except ValueError as e:
+
+        await update.message.reply_text(
+            f"❌ {e}"
+        )
+
+        return
+
+    save_user(
+        update.effective_user
+    )
+
+    save_group(
+        update.effective_chat
+    )
+
+    conn = get_db()
+
+    cursor = conn.execute("""
+        INSERT INTO schedules
+        (
+            chat_id,
+            user_id,
+            start_at,
+            end_at,
+            shift,
+            note,
+            created_at
+        )
+
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        update.effective_chat.id,
+        update.effective_user.id,
+        to_iso(start_dt),
+        to_iso(end_dt),
+        shift,
+        note,
+        to_iso(now()),
+    ))
+
+    schedule_id = cursor.lastrowid
+
+    conn.commit()
 
     row = conn.execute("""
         SELECT *
@@ -751,836 +969,407 @@ async def schedule_jobs(
 
     conn.close()
 
-    if not row:
-        return
-
-    target_date = date.fromisoformat(
-        row["schedule_date"]
+    create_schedule_jobs(
+        context.application,
+        row,
     )
 
-    start_t = datetime.strptime(
-        row["start_time"],
-        "%H:%M",
-    ).time()
-
-    end_t = datetime.strptime(
-        row["end_time"],
-        "%H:%M",
-    ).time()
-
-    start_dt = datetime.combine(
-        target_date,
-        start_t,
-        TZ,
+    text = (
+        "╔══ ✦ SCHEDULE ADDED ✦ ══╗\n\n"
+        f"🕐 <b>{start_dt.strftime('%I:%M %p')} "
+        f"– {end_dt.strftime('%I:%M %p')}</b>\n"
+        f"🌙 {shift.upper()}\n"
+        f"👤 {update.effective_user.full_name}\n"
     )
 
-    end_dt = datetime.combine(
-        target_date,
-        end_t,
-        TZ,
+    if note:
+        text += (
+            f"📝 {note}\n"
+        )
+
+    text += (
+        "\n⏰ Reminder: "
+        f"{REMINDER_MINUTES} minutes before"
     )
 
-    if end_dt <= start_dt:
-        end_dt += timedelta(days=1)
-
-    reminder_dt = (
-        start_dt
-        - timedelta(
-            minutes=REMINDER_MINUTES
-        )
-    )
-
-    now = now_local()
-
-    if reminder_dt > now:
-        context.job_queue.run_once(
-            reminder_job,
-            when=reminder_dt,
-            data={"schedule_id": schedule_id},
-            name=f"reminder_{schedule_id}",
-        )
-
-    if start_dt > now:
-        context.job_queue.run_once(
-            start_job,
-            when=start_dt,
-            data={"schedule_id": schedule_id},
-            name=f"start_{schedule_id}",
-        )
-
-    if end_dt > now:
-        context.job_queue.run_once(
-            end_job,
-            when=end_dt,
-            data={"schedule_id": schedule_id},
-            name=f"end_{schedule_id}",
-        )
-
-
-async def restore_jobs(
-    context,
-):
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT id
-        FROM schedules
-        WHERE schedule_date >= ?
-    """, (
-        today_local().isoformat(),
-    )).fetchall()
-
-    conn.close()
-
-    for row in rows:
-        try:
-            await schedule_jobs(
-                context,
-                row["id"],
-            )
-        except Exception as e:
-            logger.error(
-                "Job restore error: %s",
-                e,
-            )
-
-
-# ============================================================
-# JOB DATA
-# ============================================================
-
-def get_schedule(schedule_id):
-
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT
-            s.*,
-            g.title,
-            u.full_name,
-            u.username
-        FROM schedules s
-
-        LEFT JOIN groups g
-            ON s.chat_id = g.chat_id
-
-        LEFT JOIN users u
-            ON s.admin_id = u.user_id
-
-        WHERE s.id = ?
-    """, (
-        schedule_id,
-    )).fetchone()
-
-    conn.close()
-
-    return row
-
-
-# ============================================================
-# REMINDER
-# ============================================================
-
-async def reminder_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    schedule_id = context.job.data["schedule_id"]
-
-    row = get_schedule(
-        schedule_id
-    )
-
-    if not row:
-        return
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=row["chat_id"],
-            text=(
-                "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-                "        🔔 **DUTY REMINDER**\n"
-                "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-                f"> 👤 **ADMIN**\n"
-                f"> {row['full_name']}\n\n"
-                f"⏰ **Duty starts in 15 minutes**\n"
-                f"{row['start_time']} → {row['end_time']}\n\n"
-                f"🏷️ {row['shift'].upper()} SHIFT\n\n"
-                f"📝 {row['note'] or '—'}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚡ Please be ready."
-            ),
-            parse_mode="Markdown",
-        )
-
-    except Exception as e:
-        logger.error(
-            "Reminder error: %s",
-            e,
-        )
-
-
-# ============================================================
-# START JOB
-# ============================================================
-
-async def start_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    schedule_id = context.job.data["schedule_id"]
-
-    row = get_schedule(
-        schedule_id
-    )
-
-    if not row:
-        return
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=row["chat_id"],
-            text=(
-                "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-                "        🟢 **DUTY STARTED**\n"
-                "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-                f"👤 **Admin:** {row['full_name']}\n"
-                f"⏰ **Time:** {row['start_time']} → {row['end_time']}\n"
-                f"🏷️ **Shift:** {row['shift'].upper()}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🟢 Duty is now active."
-            ),
-            parse_mode="Markdown",
-        )
-
-        conn = get_db()
-
-        conn.execute("""
-            INSERT INTO attendance
-            (
-                schedule_id,
-                admin_id,
-                chat_id,
-                status,
-                checked_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            schedule_id,
-            row["admin_id"],
-            row["chat_id"],
-            "started",
-            now_iso(),
-        ))
-
-        conn.commit()
-        conn.close()
-
-    except Exception as e:
-        logger.error(
-            "Start job error: %s",
-            e,
-        )
-
-
-# ============================================================
-# END JOB
-# ============================================================
-
-async def end_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    schedule_id = context.job.data["schedule_id"]
-
-    row = get_schedule(
-        schedule_id
-    )
-
-    if not row:
-        return
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=row["chat_id"],
-            text=(
-                "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-                "         🔴 **DUTY ENDED**\n"
-                "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-                f"👤 **Admin:** {row['full_name']}\n"
-                f"⏰ **Finished:** {row['end_time']}\n"
-                f"🏷️ **Shift:** {row['shift'].upper()}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✓ Duty session completed."
-            ),
-            parse_mode="Markdown",
-        )
-
-    except Exception as e:
-        logger.error(
-            "End job error: %s",
-            e,
-        )
-
-
-# ============================================================
-# TODAY SCHEDULE
-# ============================================================
-
-async def show_schedule(
-    query,
-    context,
-    target_date,
-):
-
-    user_id = query.from_user.id
-
-    groups = await get_user_groups(
-        context,
-        user_id,
-    )
-
-    if not groups:
-
-        await query.edit_message_text(
-            "⛔ **Admin Group မတွေ့ပါဘူး။**",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    chat_ids = [
-        group["chat_id"]
-        for group in groups
-    ]
-
-    placeholders = ",".join(
-        "?"
-        for _ in chat_ids
-    )
-
-    conn = get_db()
-
-    rows = conn.execute(
-        f"""
-        SELECT
-            s.*,
-            g.title,
-            u.full_name
-        FROM schedules s
-
-        LEFT JOIN groups g
-            ON s.chat_id = g.chat_id
-
-        LEFT JOIN users u
-            ON s.admin_id = u.user_id
-
-        WHERE s.chat_id IN ({placeholders})
-        AND s.schedule_date = ?
-
-        ORDER BY
-            s.start_time
-        """,
-        (
-            *chat_ids,
-            target_date.isoformat(),
-        ),
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ◈ **SCHEDULE**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            f"🗓️ **{format_date(target_date)}**\n\n"
-            "> No schedule has been added yet.",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "        ◈ **SCHEDULE**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-        "",
-        f"🗓️ **{format_date(target_date)}**",
-        "",
-    ]
-
-    for row in rows:
-
-        icon = (
-            "☀️"
-            if row["shift"] == "day"
-            else "🌙"
-        )
-
-        lines.extend([
-            "╭────────────────────",
-            f"│ {icon} **{row['full_name']}**",
-            f"│ ⏰ {row['start_time']} → {row['end_time']}",
-            f"│ 🏠 {row['title']}",
-            f"│ 📝 {row['note'] or '—'}",
-            "╰────────────────────",
-            "",
-        ])
-
-    await query.edit_message_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=back_keyboard(),
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
     )
 
 
-# ============================================================
+# =========================================================
 # MY SCHEDULE
-# ============================================================
+# =========================================================
 
-async def show_my_schedule(
-    query,
-    context,
-):
-
-    user_id = query.from_user.id
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT
-            s.*,
-            g.title
-        FROM schedules s
-
-        LEFT JOIN groups g
-            ON s.chat_id = g.chat_id
-
-        WHERE s.admin_id = ?
-
-        AND s.schedule_date >= ?
-
-        ORDER BY
-            s.schedule_date,
-            s.start_time
-
-        LIMIT 30
-    """, (
-        user_id,
-        today_local().isoformat(),
-    )).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ◈ **MY SCHEDULE**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "> Schedule မရှိသေးပါဘူး။",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "        ◈ **MY SCHEDULE**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-        "",
-    ]
-
-    for row in rows:
-
-        icon = (
-            "☀️"
-            if row["shift"] == "day"
-            else "🌙"
-        )
-
-        lines.extend([
-            f"**{format_date(date.fromisoformat(row['schedule_date']))}**",
-            f"{icon} `{row['start_time']} → {row['end_time']}`",
-            f"🏠 {row['title']}",
-            f"📝 {row['note'] or '—'}",
-            "",
-        ])
-
-    await query.edit_message_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=back_keyboard(),
-    )
-
-
-# ============================================================
-# CANCEL SCHEDULE
-# ============================================================
-
-async def cancel_schedule(
+async def my_schedule_command(
     update,
     context,
 ):
 
-    if not await require_group_admin(
-        update,
-        context,
-    ):
-        return
-
-    user = update.effective_user
-    chat = update.effective_chat
+    save_user(
+        update.effective_user
+    )
 
     conn = get_db()
 
     rows = conn.execute("""
         SELECT *
         FROM schedules
+
         WHERE chat_id = ?
-        AND schedule_date >= ?
-        ORDER BY schedule_date, start_time
-        LIMIT 20
+        AND user_id = ?
+        AND end_at > ?
+
+        ORDER BY start_at
     """, (
-        chat.id,
-        today_local().isoformat(),
+        update.effective_chat.id,
+        update.effective_user.id,
+        to_iso(now()),
     )).fetchall()
 
     conn.close()
 
     if not rows:
 
-        await update.message.reply_text(
-            "📋 ဒီ Group မှာ Cancel လုပ်လို့ရမယ့် Schedule မရှိပါဘူး။"
-        )
-        return
-
-    buttons = []
-
-    for row in rows:
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"❌ {row['schedule_date']} "
-                f"{row['start_time']} "
-                f"→ {row['end_time']}",
-                callback_data=f"cancel:{row['id']}",
-            )
-        ])
-
-    await update.message.reply_text(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "       ❌ **CANCEL SCHEDULE**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "ဖျက်ချင်တဲ့ Schedule ကို ရွေးပါ။",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        ),
-    )
-
-
-# ============================================================
-# ADMINS LIST
-# ============================================================
-
-async def show_admins(
-    query,
-    context,
-):
-
-    groups = await get_user_groups(
-        context,
-        query.from_user.id,
-    )
-
-    if not groups:
-
-        await query.edit_message_text(
-            "⛔ Admin Group မတွေ့ပါဘူး။",
-            reply_markup=back_keyboard(),
+        await update.effective_message.reply_text(
+            "◈ <b>MY SCHEDULE</b>\n\n"
+            "No upcoming schedule.",
+            parse_mode="HTML",
         )
 
         return
 
     lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "          ♛ **ADMINS**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
+        "╔══ ✦ MY SCHEDULE ✦ ══╗",
         "",
     ]
 
-    for group in groups:
+    for index, row in enumerate(
+        rows,
+        1,
+    ):
+
+        start_dt = datetime.fromisoformat(
+            row["start_at"]
+        ).astimezone(TZ)
+
+        end_dt = datetime.fromisoformat(
+            row["end_at"]
+        ).astimezone(TZ)
 
         lines.append(
-            f"🏠 **{group['title']}**"
+            f"<b>{index}. "
+            f"{start_dt.strftime('%I:%M %p')} – "
+            f"{end_dt.strftime('%I:%M %p')}</b>"
         )
 
-        try:
+        lines.append(
+            f"🌙 {row['shift'].upper()}"
+        )
 
-            admins = await context.bot.get_chat_administrators(
-                group["chat_id"]
-            )
-
-            for member in admins:
-
-                name = user_display(
-                    member.user
-                )
-
-                role = (
-                    "OWNER"
-                    if member.status == ChatMemberStatus.OWNER
-                    else "ADMIN"
-                )
-
-                lines.append(
-                    f"  ♛ {name} — `{role}`"
-                )
-
-        except Exception as e:
-
-            logger.error(
-                "Admin list error: %s",
-                e,
+        if row["note"]:
+            lines.append(
+                f"📝 {row['note']}"
             )
 
         lines.append("")
 
-    await query.edit_message_text(
+    await update.effective_message.reply_text(
         "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=back_keyboard(),
+        parse_mode="HTML",
     )
 
 
-# ============================================================
+# =========================================================
+# ADMINS
+# =========================================================
+
+async def admins_command(
+    update,
+    context,
+):
+
+    if update.effective_chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+
+        await update.message.reply_text(
+            "ဒီ command ကို Group ထဲမှာ သုံးပါ။"
+        )
+
+        return
+
+    admins = await update.effective_chat.get_administrators()
+
+    lines = [
+        "╔══ ✦ GROUP ADMINS ✦ ══╗",
+        "",
+    ]
+
+    for index, admin in enumerate(
+        admins,
+        1,
+    ):
+
+        user = admin.user
+
+        name = (
+            f"@{user.username}"
+            if user.username
+            else user.full_name
+        )
+
+        role = (
+            "OWNER"
+            if admin.status == "creator"
+            else "ADMIN"
+        )
+
+        lines.append(
+            f"{index}. {name} — <b>{role}</b>"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
 # REPORT
-# ============================================================
+# =========================================================
 
 async def report_command(
     update,
     context,
 ):
 
-    if not await require_group_admin(
-        update,
-        context,
-    ):
+    if not await require_admin(update):
         return
 
-    chat = update.effective_chat
+    chat_id = update.effective_chat.id
 
-    start_date = today_local()
+    today = now().date()
 
-    end_date = (
-        start_date
-        + timedelta(days=7)
+    start = datetime.combine(
+        today,
+        time.min,
+        tzinfo=TZ,
     )
+
+    end = start + timedelta(days=1)
 
     conn = get_db()
 
-    schedules = conn.execute("""
-        SELECT
-            s.*,
-            u.full_name
-        FROM schedules s
-
-        LEFT JOIN users u
-            ON s.admin_id = u.user_id
-
-        WHERE s.chat_id = ?
-
-        AND s.schedule_date >= ?
-
-        AND s.schedule_date < ?
-
-        ORDER BY
-            s.schedule_date,
-            s.start_time
+    schedule_count = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM schedules
+        WHERE chat_id = ?
+        AND start_at >= ?
+        AND start_at < ?
     """, (
-        chat.id,
-        start_date.isoformat(),
-        end_date.isoformat(),
-    )).fetchall()
+        chat_id,
+        to_iso(start),
+        to_iso(end),
+    )).fetchone()["count"]
 
-    members = conn.execute("""
-        SELECT COUNT(*) AS total
+    joins = conn.execute("""
+        SELECT COUNT(*) AS count
         FROM member_events
         WHERE chat_id = ?
-        AND created_at >= ?
+        AND event = 'join'
+        AND event_at >= ?
     """, (
-        chat.id,
-        (
-            datetime.combine(
-                start_date,
-                time.min,
-                TZ,
-            ).isoformat()
-        ),
-    )).fetchone()
+        chat_id,
+        to_iso(start),
+    )).fetchone()["count"]
+
+    leaves = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM member_events
+        WHERE chat_id = ?
+        AND event = 'leave'
+        AND event_at >= ?
+    """, (
+        chat_id,
+        to_iso(start),
+    )).fetchone()["count"]
 
     conn.close()
 
-    lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "        ▣ **WEEKLY REPORT**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-        "",
-        f"🏠 **{chat.title}**",
-        f"🗓️ {format_date(start_date)}",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"📅 **Schedules:** {len(schedules)}",
-        f"👥 **Member Events:** {members['total']}",
-        "",
-    ]
-
-    if schedules:
-
-        for row in schedules:
-
-            lines.append(
-                f"• {row['schedule_date']} "
-                f"| {row['start_time']} → "
-                f"{row['end_time']}"
-            )
-
-            lines.append(
-                f"  👤 {row['full_name']}"
-            )
-
-            lines.append("")
-
-    else:
-
-        lines.append(
-            "> No schedule data."
-        )
-
     await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
+        "╔══ ✦ DAILY REPORT ✦ ══╗\n\n"
+        f"📅 {today.strftime('%d %B %Y')}\n\n"
+        f"📅 Schedules: <b>{schedule_count}</b>\n"
+        f"🟢 Joined: <b>{joins}</b>\n"
+        f"🔴 Left: <b>{leaves}</b>",
+        parse_mode="HTML",
     )
 
 
-# ============================================================
-# ADD ADMIN
-# ============================================================
+# =========================================================
+# CANCEL
+# =========================================================
 
-async def add_admin(
+async def cancel_schedule_command(
     update,
     context,
 ):
 
-    if not await require_group_admin(
-        update,
-        context,
-    ):
+    if not await require_admin(update):
         return
 
     if not context.args:
 
         await update.message.reply_text(
-            "အသုံးပြုပုံ:\n\n"
-            "`/addadmin USER_ID`",
-            parse_mode="Markdown",
+            "အသုံးပြုပုံ:\n"
+            "<code>/cancelschedule 123</code>",
+            parse_mode="HTML",
         )
+
         return
 
     try:
-
-        user_id = int(
+        schedule_id = int(
             context.args[0]
         )
-
     except ValueError:
 
         await update.message.reply_text(
-            "❌ User ID က နံပါတ်ဖြစ်ရပါမယ်။"
+            "❌ Schedule ID မှားနေပါတယ်။"
         )
+
         return
 
-    chat = update.effective_chat
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT *
+        FROM schedules
+        WHERE id = ?
+        AND chat_id = ?
+    """, (
+        schedule_id,
+        update.effective_chat.id,
+    )).fetchone()
+
+    if not row:
+
+        conn.close()
+
+        await update.message.reply_text(
+            "❌ Schedule မတွေ့ပါ။"
+        )
+
+        return
+
+    conn.execute("""
+        DELETE FROM schedules
+        WHERE id = ?
+    """, (
+        schedule_id,
+    ))
+
+    conn.commit()
+    conn.close()
+
+    remove_schedule_jobs(
+        context.application,
+        schedule_id,
+    )
+
+    await update.message.reply_text(
+        f"✅ Schedule #{schedule_id} ဖျက်ပြီးပါပြီ။"
+    )
+
+
+# =========================================================
+# ADD / REMOVE ADMIN
+# =========================================================
+
+async def add_admin_command(
+    update,
+    context,
+):
+
+    if not await require_admin(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "အသုံးပြုပုံ:\n"
+            "<code>/addadmin USER_ID</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    try:
+        user_id = int(
+            context.args[0]
+        )
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ User ID မှားနေပါတယ်။"
+        )
+
+        return
 
     conn = get_db()
 
     conn.execute("""
-        INSERT OR REPLACE INTO group_admins
-        (
-            chat_id,
-            user_id,
-            role,
-            note,
-            added_at
-        )
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO group_admins
+        (chat_id, user_id, added_at)
+        VALUES (?, ?, ?)
     """, (
-        chat.id,
+        update.effective_chat.id,
         user_id,
-        "admin",
-        "",
-        now_iso(),
+        to_iso(now()),
     ))
 
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
-        "✅ Admin record ထည့်ပြီးပါပြီ။\n\n"
-        f"🆔 `{user_id}`",
-        parse_mode="Markdown",
+        "✅ Bot admin list ထဲ ထည့်ပြီးပါပြီ။\n\n"
+        "မှတ်ချက် — ဒီ command က Telegram ရဲ့ "
+        "Admin permission ကို မပြောင်းပေးပါ။"
     )
 
 
-# ============================================================
-# REMOVE ADMIN
-# ============================================================
-
-async def remove_admin(
+async def remove_admin_command(
     update,
     context,
 ):
 
-    if not await require_group_admin(
-        update,
-        context,
-    ):
+    if not await require_admin(update):
         return
 
     if not context.args:
 
         await update.message.reply_text(
-            "အသုံးပြုပုံ:\n\n"
-            "`/removeadmin USER_ID`",
-            parse_mode="Markdown",
+            "အသုံးပြုပုံ:\n"
+            "<code>/removeadmin USER_ID</code>",
+            parse_mode="HTML",
         )
+
         return
 
     try:
-
         user_id = int(
             context.args[0]
         )
-
     except ValueError:
 
         await update.message.reply_text(
-            "❌ User ID မမှန်ပါဘူး။"
+            "❌ User ID မှားနေပါတယ်။"
         )
-        return
 
-    chat = update.effective_chat
+        return
 
     conn = get_db()
 
@@ -1589,7 +1378,7 @@ async def remove_admin(
         WHERE chat_id = ?
         AND user_id = ?
     """, (
-        chat.id,
+        update.effective_chat.id,
         user_id,
     ))
 
@@ -1597,351 +1386,64 @@ async def remove_admin(
     conn.close()
 
     await update.message.reply_text(
-        "🗑️ Admin record ဖယ်ရှားပြီးပါပြီ။"
+        "✅ Bot admin list ကနေ ဖယ်ရှားပြီးပါပြီ။"
     )
 
 
-# ============================================================
-# MEMBER JOIN / LEAVE
-# ============================================================
+# =========================================================
+# GROUP ID
+# =========================================================
 
-async def member_update(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat_member = update.chat_member
-
-    if not chat_member:
-        return
-
-    chat = chat_member.chat
-
-    old_status = chat_member.old_chat_member.status
-    new_status = chat_member.new_chat_member.status
-
-    user = chat_member.new_chat_member.user
-
-    register_group(
-        chat.id,
-        chat.title,
-    )
-
-    event = None
-
-    if new_status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.RESTRICTED,
-    ) and old_status in (
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    ):
-        event = "join"
-
-    elif new_status in (
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    ) and old_status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.RESTRICTED,
-        ChatMemberStatus.ADMINISTRATOR,
-    ):
-        event = "leave"
-
-    if not event:
-        return
-
-    register_user(user)
-
-    conn = get_db()
-
-    conn.execute("""
-        INSERT INTO member_events
-        (
-            chat_id,
-            user_id,
-            username,
-            full_name,
-            event,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        chat.id,
-        user.id,
-        user.username or "",
-        user.full_name or "",
-        event,
-        now_iso(),
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# /GROUPID
-# ============================================================
-
-async def groupid(
+async def groupid_command(
     update,
     context,
 ):
 
-    chat = update.effective_chat
-
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
-
-        await update.message.reply_text(
-            "ဒီ command ကို Group ထဲမှာ သုံးပါ။"
-        )
-
-        return
-
-    register_group(
-        chat.id,
-        chat.title,
+    save_group(
+        update.effective_chat
     )
 
     await update.message.reply_text(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "          ◈ **GROUP INFO**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        f"🏠 **Group:** {chat.title}\n\n"
-        f"🆔 **ID:** `{chat.id}`",
-        parse_mode="Markdown",
+        "🆔 <b>Group ID</b>\n\n"
+        f"<code>{update.effective_chat.id}</code>",
+        parse_mode="HTML",
     )
 
 
-# ============================================================
-# /CHECKADMIN
-# ============================================================
+# =========================================================
+# CHECK ADMIN
+# =========================================================
 
-async def checkadmin(
+async def checkadmin_command(
     update,
     context,
 ):
 
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
+    if await is_admin(update):
 
         await update.message.reply_text(
-            "ဒီ command ကို Group ထဲမှာ သုံးပါ။"
-        )
-
-        return
-
-    admin = await is_group_admin(
-        context,
-        chat.id,
-        user.id,
-    )
-
-    if admin:
-
-        register_group(
-            chat.id,
-            chat.title,
-        )
-
-        await update.message.reply_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ♛ **ADMIN VERIFIED**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "✅ မင်းက ဒီ Group ရဲ့ Admin ဖြစ်ပါတယ်။\n\n"
-            "🔐 Permission: **ACTIVE**"
+            "✅ <b>မင်းက ဒီ Group ရဲ့ Admin ဖြစ်ပါတယ်။</b>",
+            parse_mode="HTML",
         )
 
     else:
 
         await update.message.reply_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ⛔ **ACCESS DENIED**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "ဒီ Group ရဲ့ Admin မဟုတ်ပါဘူး။"
+            "❌ မင်းက ဒီ Group ရဲ့ Admin မဟုတ်ပါဘူး။",
+            parse_mode="HTML",
         )
 
 
-# ============================================================
-# /TODAY
-# ============================================================
-
-async def today_command(
-    update,
-    context,
-):
-
-    if not await require_group_admin(
-        update,
-        context,
-    ):
-        return
-
-    chat = update.effective_chat
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT
-            s.*,
-            u.full_name
-        FROM schedules s
-
-        LEFT JOIN users u
-            ON s.admin_id = u.user_id
-
-        WHERE s.chat_id = ?
-        AND s.schedule_date = ?
-
-        ORDER BY s.start_time
-    """, (
-        chat.id,
-        today_local().isoformat(),
-    )).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await update.message.reply_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "       ✦ **TODAY**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "> Schedule မရှိသေးပါဘူး။"
-        )
-
-        return
-
-    lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "       ✦ **TODAY DUTY**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-        "",
-    ]
-
-    for row in rows:
-
-        icon = (
-            "☀️"
-            if row["shift"] == "day"
-            else "🌙"
-        )
-
-        lines.extend([
-            f"{icon} **{row['full_name']}**",
-            f"⏰ {row['start_time']} → {row['end_time']}",
-            f"📝 {row['note'] or '—'}",
-            "",
-        ])
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# /TOMORROW
-# ============================================================
-
-async def tomorrow_command(
-    update,
-    context,
-):
-
-    if not await require_group_admin(
-        update,
-        context,
-    ):
-        return
-
-    chat = update.effective_chat
-
-    target = (
-        today_local()
-        + timedelta(days=1)
-    )
-
-    conn = get_db()
-
-    rows = conn.execute("""
-        SELECT
-            s.*,
-            u.full_name
-        FROM schedules s
-
-        LEFT JOIN users u
-            ON s.admin_id = u.user_id
-
-        WHERE s.chat_id = ?
-        AND s.schedule_date = ?
-
-        ORDER BY s.start_time
-    """, (
-        chat.id,
-        target.isoformat(),
-    )).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await update.message.reply_text(
-            "📅 **Tomorrow**\n\n"
-            "> Schedule မရှိသေးပါဘူး။",
-            parse_mode="Markdown",
-        )
-
-        return
-
-    lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "      ✦ **TOMORROW DUTY**",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-        "",
-    ]
-
-    for row in rows:
-
-        icon = (
-            "☀️"
-            if row["shift"] == "day"
-            else "🌙"
-        )
-
-        lines.extend([
-            f"{icon} **{row['full_name']}**",
-            f"⏰ {row['start_time']} → {row['end_time']}",
-            f"📝 {row['note'] or '—'}",
-            "",
-        ])
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# OWNER BROADCAST
-# ============================================================
+# =========================================================
+# BROADCAST
+# =========================================================
 
 async def broadcast_command(
     update,
     context,
 ):
 
-    user = update.effective_user
-
-    if user.id != OWNER_ID:
+    if update.effective_user.id != OWNER_ID:
 
         await update.message.reply_text(
             "⛔ Owner only."
@@ -1952,13 +1454,11 @@ async def broadcast_command(
     if not update.message.reply_to_message:
 
         await update.message.reply_text(
-            "Broadcast လုပ်ချင်တဲ့ message ကို "
-            "Reply လုပ်ပြီး `/broadcast` ပို့ပါ။"
+            "Broadcast လုပ်မယ့် message ကို "
+            "Reply လုပ်ပြီး /broadcast ပို့ပါ။"
         )
 
         return
-
-    source = update.message.reply_to_message
 
     conn = get_db()
 
@@ -1974,52 +1474,48 @@ async def broadcast_command(
 
     conn.close()
 
-    sent = 0
-    failed = 0
-
     targets = set()
 
     for row in users:
-        targets.add(row["user_id"])
+        targets.add(
+            row["user_id"]
+        )
 
     for row in groups:
-        targets.add(row["chat_id"])
+        targets.add(
+            row["chat_id"]
+        )
+
+    sent = 0
+    failed = 0
 
     for chat_id in targets:
 
         try:
 
-            await source.copy(
-                chat_id=chat_id,
+            await update.message.reply_to_message.copy(
+                chat_id=chat_id
             )
 
             sent += 1
 
-        except Exception as e:
-
-            logger.warning(
-                "Broadcast failed %s: %s",
-                chat_id,
-                e,
-            )
+        except Exception:
 
             failed += 1
 
     await update.message.reply_text(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "        📢 **BROADCAST DONE**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        f"🟢 Sent: **{sent}**\n"
-        f"🔴 Failed: **{failed}**",
-        parse_mode="Markdown",
+        "╔══ ✦ BROADCAST ✦ ══╗\n\n"
+        f"✅ Sent: <b>{sent}</b>\n"
+        f"❌ Failed: <b>{failed}</b>",
+        parse_mode="HTML",
     )
 
 
-# ============================================================
-# CALLBACKS
-# ============================================================
+# =========================================================
+# BUTTON HANDLER
+# =========================================================
 
-async def callbacks(
+async def button_handler(
     update,
     context,
 ):
@@ -2030,495 +1526,509 @@ async def callbacks(
 
     data = query.data
 
-    # HOME
-    if data == "home":
-
-        await query.edit_message_text(
-            welcome_text(
-                "LUXURY NEXUS"
-            ),
-            parse_mode="Markdown",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # TODAY
     if data == "today":
 
-        groups = await get_user_groups(
-            context,
-            query.from_user.id,
+        await show_day(
+            query,
+            now().date(),
         )
-
-        if groups:
-
-            await show_schedule(
-                query,
-                context,
-                today_local(),
-            )
-
-        else:
-
-            await query.edit_message_text(
-                "⛔ Admin Group မတွေ့ပါဘူး။",
-                reply_markup=back_keyboard(),
-            )
 
         return
 
-    # TOMORROW
     if data == "tomorrow":
 
-        await show_schedule(
+        await show_day(
             query,
-            context,
-            today_local()
+            now().date()
             + timedelta(days=1),
         )
 
         return
 
-    # MINE
-    if data == "mine":
+    if data == "add_schedule":
 
-        await show_my_schedule(
-            query,
-            context,
+        await query.message.reply_text(
+            "＋ <b>ADD SCHEDULE</b>\n\n"
+            "ဒီလိုပို့ပါ:\n\n"
+            "<code>Today 12:15-1:00 day</code>\n"
+            "<code>Tomorrow 8:00-12:00 night</code>\n\n"
+            "Note:\n"
+            "<code>Today 12:15-1:00 day | meeting</code>",
+            parse_mode="HTML",
         )
 
         return
 
-    # ADD
-    if data == "add":
+    if data == "my_schedule":
 
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "       ＋ **ADD SCHEDULE**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "DM မှာ ဒီလိုပို့ပါ 👇\n\n"
-            "> `Today 12:15-1:00 day`\n\n"
-            "> `Tomorrow 8:00-12:00 night`\n\n"
-            "📝 Note ထည့်ချင်ရင် —\n"
-            "> `Today 12:15-1:00 day morning duty`",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # ADMINS
-    if data == "admins":
-
-        await show_admins(
-            query,
-            context,
-        )
-
-        return
-
-    # REPORTS
-    if data == "reports":
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ▣ **REPORTS**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "Group ထဲမှာ\n\n"
-            "`/report`\n\n"
-            "ကိုသုံးပြီး Weekly Report ကြည့်နိုင်ပါတယ်။",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # SETTINGS
-    if data == "settings":
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "        ⚙ **SETTINGS**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "🕐 Timezone: **Myanmar Time**\n"
-            "🔔 Reminder: **15 minutes**\n"
-            "👥 Member Tracking: **ON**\n"
-            "💾 Database: **ON**",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # HELP
-    if data == "help":
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "         ❔ **HELP**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "🗓️ Schedule format:\n\n"
-            "> `Today 12:15-1:00 day`\n"
-            "> `Tomorrow 8:00-12:00 night`\n\n"
-            "Commands:\n\n"
-            "• `/today`\n"
-            "• `/tomorrow`\n"
-            "• `/report`\n"
-            "• `/cancelschedule`\n"
-            "• `/checkadmin`\n"
-            "• `/groupid`\n\n"
-            "🔔 15-min Reminder\n"
-            "🟢 Start Notification\n"
-            "🔴 End Notification",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard(),
-        )
-
-        return
-
-    # SELECT GROUP
-    if data.startswith("sg:"):
-
-        chat_id = int(
-            data.split(
-                ":",
-                1,
-            )[1]
-        )
-
-        pending = context.user_data.get(
-            "pending_schedule"
-        )
-
-        if not pending:
-
-            await query.edit_message_text(
-                "❌ Schedule session expired."
-            )
-
-            return
-
-        user_id = query.from_user.id
-
-        if not await is_group_admin(
-            context,
-            chat_id,
-            user_id,
-        ):
-
-            await query.edit_message_text(
-                "⛔ ဒီ Group ရဲ့ Admin မဟုတ်တော့ပါဘူး။"
-            )
-
-            return
-
-        target_date = (
-            today_local()
-            if pending["day"] == "today"
-            else today_local()
-            + timedelta(days=1)
-        )
-
-        start_t = datetime.strptime(
-            pending["start"],
-            "%H:%M",
-        ).time()
-
-        end_t = datetime.strptime(
-            pending["end"],
-            "%H:%M",
-        ).time()
-
-        schedule_id = save_schedule(
-            chat_id,
-            user_id,
-            target_date,
-            start_t,
-            end_t,
-            pending["shift"],
-            pending["note"],
-        )
-
-        await schedule_jobs(
-            context,
-            schedule_id,
-        )
+        rows = []
 
         conn = get_db()
 
-        row = conn.execute("""
-            SELECT title
-            FROM groups
+        rows = conn.execute("""
+            SELECT *
+            FROM schedules
             WHERE chat_id = ?
+            AND user_id = ?
+            AND end_at > ?
+            ORDER BY start_at
         """, (
-            chat_id,
-        )).fetchone()
+            query.message.chat.id,
+            query.from_user.id,
+            to_iso(now()),
+        )).fetchall()
 
         conn.close()
 
-        title = (
-            row["title"]
-            if row
-            else "Group"
-        )
+        if not rows:
 
-        await query.edit_message_text(
-            schedule_saved_text(
-                title,
-                query.from_user,
-                target_date,
-                start_t,
-                end_t,
-                pending["shift"],
-                pending["note"],
-            ),
-            parse_mode="Markdown",
-        )
+            await query.message.reply_text(
+                "◈ <b>MY SCHEDULE</b>\n\n"
+                "No upcoming schedule.",
+                parse_mode="HTML",
+            )
 
-        context.user_data.pop(
-            "pending_schedule",
-            None,
+            return
+
+        lines = [
+            "╔══ ✦ MY SCHEDULE ✦ ══╗",
+            "",
+        ]
+
+        for index, row in enumerate(
+            rows,
+            1,
+        ):
+
+            start_dt = datetime.fromisoformat(
+                row["start_at"]
+            ).astimezone(TZ)
+
+            end_dt = datetime.fromisoformat(
+                row["end_at"]
+            ).astimezone(TZ)
+
+            lines.append(
+                f"<b>{index}. "
+                f"{start_dt.strftime('%I:%M %p')} – "
+                f"{end_dt.strftime('%I:%M %p')}</b>"
+            )
+
+            lines.append(
+                f"🌙 {row['shift'].upper()}"
+            )
+
+            if row["note"]:
+                lines.append(
+                    f"📝 {row['note']}"
+                )
+
+            lines.append("")
+
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
         )
 
         return
 
-    # CANCEL
-    if data.startswith("cancel:"):
+    if data == "admins":
 
-        schedule_id = int(
-            data.split(
-                ":",
-                1,
-            )[1]
-        )
+        admins = await query.message.chat.get_administrators()
 
-        row = get_schedule(
-            schedule_id
-        )
+        lines = [
+            "╔══ ✦ GROUP ADMINS ✦ ══╗",
+            "",
+        ]
 
-        if not row:
+        for index, admin in enumerate(
+            admins,
+            1,
+        ):
 
-            await query.edit_message_text(
-                "❌ Schedule မတွေ့တော့ပါဘူး။"
+            user = admin.user
+
+            name = (
+                f"@{user.username}"
+                if user.username
+                else user.full_name
             )
 
-            return
+            role = (
+                "OWNER"
+                if admin.status == "creator"
+                else "ADMIN"
+            )
 
-        if not await is_group_admin(
-            context,
-            row["chat_id"],
+            lines.append(
+                f"{index}. {name} — <b>{role}</b>"
+            )
+
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if data == "report":
+
+        if not await is_admin(
+            update,
             query.from_user.id,
         ):
 
-            await query.edit_message_text(
-                "⛔ Permission denied."
+            await query.message.reply_text(
+                "⛔ Admin only."
             )
 
             return
+
+        chat_id = query.message.chat.id
+
+        today = now().date()
+
+        start = datetime.combine(
+            today,
+            time.min,
+            tzinfo=TZ,
+        )
+
+        end = start + timedelta(days=1)
+
+        conn = get_db()
+
+        schedule_count = conn.execute("""
+            SELECT COUNT(*) AS count
+            FROM schedules
+            WHERE chat_id = ?
+            AND start_at >= ?
+            AND start_at < ?
+        """, (
+            chat_id,
+            to_iso(start),
+            to_iso(end),
+        )).fetchone()["count"]
+
+        joins = conn.execute("""
+            SELECT COUNT(*) AS count
+            FROM member_events
+            WHERE chat_id = ?
+            AND event = 'join'
+            AND event_at >= ?
+        """, (
+            chat_id,
+            to_iso(start),
+        )).fetchone()["count"]
+
+        leaves = conn.execute("""
+            SELECT COUNT(*) AS count
+            FROM member_events
+            WHERE chat_id = ?
+            AND event = 'leave'
+            AND event_at >= ?
+        """, (
+            chat_id,
+            to_iso(start),
+        )).fetchone()["count"]
+
+        conn.close()
+
+        await query.message.reply_text(
+            "╔══ ✦ DAILY REPORT ✦ ══╗\n\n"
+            f"📅 {today.strftime('%d %B %Y')}\n\n"
+            f"📅 Schedules: <b>{schedule_count}</b>\n"
+            f"🟢 Joined: <b>{joins}</b>\n"
+            f"🔴 Left: <b>{leaves}</b>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    if data == "help":
+
+        await query.message.reply_text(
+            "╔══ ✦ HELP ✦ ══╗\n\n"
+
+            "<b>Schedule</b>\n"
+            "<code>Today 12:15-1:00 day</code>\n"
+            "<code>Tomorrow 8:00-12:00 night</code>\n\n"
+
+            "<b>Commands</b>\n"
+            "/start\n"
+            "/today\n"
+            "/tomorrow\n"
+            "/schedule\n"
+            "/myschedule\n"
+            "/cancelschedule ID\n"
+            "/admins\n"
+            "/report\n"
+            "/addadmin USER_ID\n"
+            "/removeadmin USER_ID\n"
+            "/groupid\n"
+            "/checkadmin\n"
+            "/broadcast",
+            parse_mode="HTML",
+        )
+
+        return
+
+
+# =========================================================
+# MEMBER TRACKING
+# =========================================================
+
+async def member_update(
+    update,
+    context,
+):
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    save_group(chat)
+
+    event_data = update.chat_member
+
+    if not event_data:
+        return
+
+    old_status = (
+        event_data
+        .old_chat_member
+        .status
+    )
+
+    new_status = (
+        event_data
+        .new_chat_member
+        .status
+    )
+
+    user = (
+        event_data
+        .new_chat_member
+        .user
+    )
+
+    save_user(user)
+
+    joined = {
+        "member",
+        "administrator",
+        "creator",
+    }
+
+    left = {
+        "left",
+        "kicked",
+    }
+
+    event = None
+
+    if (
+        old_status not in joined
+        and new_status in joined
+    ):
+        event = "join"
+
+    elif (
+        old_status in joined
+        and new_status in left
+    ):
+        event = "leave"
+
+    if event:
 
         conn = get_db()
 
         conn.execute("""
-            DELETE FROM schedules
-            WHERE id = ?
+            INSERT INTO member_events
+            (chat_id, user_id, event, event_at)
+            VALUES (?, ?, ?, ?)
         """, (
-            schedule_id,
+            chat.id,
+            user.id,
+            event,
+            to_iso(now()),
         ))
 
         conn.commit()
         conn.close()
 
-        # Remove jobs
-        for job_name in (
-            f"reminder_{schedule_id}",
-            f"start_{schedule_id}",
-            f"end_{schedule_id}",
-        ):
 
-            jobs = context.job_queue.get_jobs_by_name(
-                job_name
-            )
-
-            for job in jobs:
-                job.schedule_removal()
-
-        await query.edit_message_text(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "       ✓ **SCHEDULE CANCELLED**\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            "Schedule ကို ဖျက်ပြီးပါပြီ။"
-        )
-
-        return
-
-
-# ============================================================
+# =========================================================
 # CLEANUP
-# ============================================================
+# =========================================================
 
-async def cleanup_job(
-    context,
-):
+async def cleanup_job(context):
 
-    cutoff = (
-        today_local()
-        - timedelta(days=30)
+    cutoff = now() - timedelta(
+        days=30
     )
 
     conn = get_db()
 
     conn.execute("""
         DELETE FROM schedules
-        WHERE schedule_date < ?
+        WHERE end_at < ?
     """, (
-        cutoff.isoformat(),
+        to_iso(cutoff),
     ))
 
     conn.execute("""
         DELETE FROM member_events
-        WHERE created_at < ?
+        WHERE event_at < ?
     """, (
-        datetime.combine(
-            cutoff,
-            time.min,
-            TZ,
-        ).isoformat(),
+        to_iso(cutoff),
     ))
 
     conn.commit()
     conn.close()
 
-    logger.info(
-        "Old data cleanup completed."
-    )
 
-
-# ============================================================
+# =========================================================
 # POST INIT
-# ============================================================
+# =========================================================
 
-async def post_init(
-    application,
-):
+async def post_init(app):
 
-    await restore_jobs(
-        application,
-    )
+    init_db()
 
-    application.job_queue.run_repeating(
+    await restore_jobs(app)
+
+    app.job_queue.run_repeating(
         cleanup_job,
-        interval=86400,
-        first=60,
-        name="daily_cleanup",
-    )
-
-    logger.info(
-        "Schedule jobs restored."
+        interval=timedelta(days=1),
+        first=timedelta(minutes=5),
+        name="database_cleanup",
     )
 
 
-# ============================================================
-# ERROR
-# ============================================================
+# =========================================================
+# GLOBAL APPLICATION
+# =========================================================
 
-async def error_handler(
-    update,
-    context,
-):
-
-    logger.error(
-        "Update error: %s",
-        context.error,
-    )
+current_application = None
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 def main():
 
-    if not TOKEN:
+    global current_application
 
+    if not TOKEN:
         raise RuntimeError(
             "BOT_TOKEN is missing."
         )
 
+    if not OWNER_ID:
+        raise RuntimeError(
+            "OWNER_ID is missing."
+        )
+
     init_db()
 
-    app = (
+    application = (
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(post_init)
         .build()
     )
 
+    current_application = application
+
     # Commands
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "start",
-            start,
+            start_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "today",
             today_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "tomorrow",
             tomorrow_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "schedule",
+            schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myschedule",
+            my_schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancelschedule",
+            cancel_schedule_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "admins",
+            admins_command,
+        )
+    )
+
+    application.add_handler(
         CommandHandler(
             "report",
             report_command,
         )
     )
 
-    app.add_handler(
-        CommandHandler(
-            "cancelschedule",
-            cancel_schedule,
-        )
-    )
-
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "addadmin",
-            add_admin,
+            add_admin_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "removeadmin",
-            remove_admin,
+            remove_admin_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "groupid",
-            groupid,
+            groupid_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "checkadmin",
-            checkadmin,
+            checkadmin_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "broadcast",
             broadcast_command,
@@ -2526,69 +2036,33 @@ def main():
     )
 
     # Buttons
-    app.add_handler(
+    application.add_handler(
         CallbackQueryHandler(
-            callbacks,
+            button_handler
         )
     )
 
-    # Member join / leave
-    app.add_handler(
+    # Member tracking
+    application.add_handler(
         ChatMemberHandler(
             member_update,
             ChatMemberHandler.CHAT_MEMBER,
         )
     )
 
-    # Schedule text
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            handle_schedule_text,
-        )
+    logger.info(
+        "🤖 Group Admin Management Bot is running..."
     )
 
-    app.add_error_handler(
-        error_handler
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
     )
 
-    print(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        flush=True,
-    )
 
-    print(
-        "🤖 GROUP ADMIN MANAGEMENT BOT",
-        flush=True,
-    )
-
-    print(
-        "✦ Premium UI Edition",
-        flush=True,
-    )
-
-    print(
-        "🕐 Myanmar Time",
-        flush=True,
-    )
-
-    print(
-        "🔔 Reminder System: ON",
-        flush=True,
-    )
-
-    print(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        flush=True,
-    )
-
-    app.run_polling()
-
-
-# ============================================================
+# =========================================================
 # RUN
-# ============================================================
+# =========================================================
 
 if __name__ == "__main__":
     main()
