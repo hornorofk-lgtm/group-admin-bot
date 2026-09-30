@@ -19,12 +19,16 @@ from telegram.ext import (
 )
 
 # ==========================================
-# SETTINGS
+# CONFIG
 # ==========================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# ==========================================
+# LOGGING
+# ==========================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,7 +49,6 @@ def get_db():
 
 
 def init_db():
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -95,11 +98,10 @@ def init_db():
 
 
 # ==========================================
-# USER REGISTER
+# USER
 # ==========================================
 
 def register_user(user):
-
     if not user:
         return
 
@@ -107,7 +109,12 @@ def register_user(user):
 
     conn.execute("""
         INSERT OR REPLACE INTO users
-        (user_id, username, full_name, started_at)
+        (
+            user_id,
+            username,
+            full_name,
+            started_at
+        )
         VALUES (?, ?, ?, ?)
     """, (
         user.id,
@@ -121,16 +128,20 @@ def register_user(user):
 
 
 # ==========================================
-# GROUP REGISTER
+# GROUP
 # ==========================================
 
 def register_group(chat_id, title, owner_id=None):
-
     conn = get_db()
 
     conn.execute("""
         INSERT OR IGNORE INTO groups
-        (chat_id, title, owner_id, created_at)
+        (
+            chat_id,
+            title,
+            owner_id,
+            created_at
+        )
         VALUES (?, ?, ?, ?)
     """, (
         chat_id,
@@ -153,14 +164,10 @@ def register_group(chat_id, title, owner_id=None):
 
 
 # ==========================================
-# CHECK GROUP ADMIN
+# ADMIN CHECK
 # ==========================================
 
-async def is_group_admin(
-    context,
-    chat_id,
-    user_id
-):
+async def is_group_admin(context, chat_id, user_id):
 
     try:
 
@@ -185,18 +192,17 @@ async def is_group_admin(
 
 
 # ==========================================
-# FIND USER GROUPS
+# GET GROUPS WHERE USER IS ADMIN
 # ==========================================
 
-async def get_user_groups(
-    context,
-    user_id
-):
+async def get_user_groups(context, user_id):
 
     conn = get_db()
 
     rows = conn.execute("""
-        SELECT chat_id, title
+        SELECT
+            chat_id,
+            title
         FROM groups
         ORDER BY title
     """).fetchall()
@@ -212,20 +218,16 @@ async def get_user_groups(
             row["chat_id"],
             user_id,
         ):
-
             result.append(row)
 
     return result
 
 
 # ==========================================
-# START
+# /START
 # ==========================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
@@ -250,36 +252,43 @@ async def start(
         group_name = "Luxury Nexus"
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "🗓️ Today Schedule",
                 callback_data="today",
             ),
+
             InlineKeyboardButton(
                 "📅 Tomorrow",
                 callback_data="tomorrow",
             ),
         ],
+
         [
             InlineKeyboardButton(
                 "➕ Add Schedule",
                 callback_data="add",
             ),
+
             InlineKeyboardButton(
                 "📋 My Schedule",
                 callback_data="mine",
             ),
         ],
+
         [
             InlineKeyboardButton(
                 "👑 Admins",
                 callback_data="admins",
             ),
+
             InlineKeyboardButton(
                 "📊 Reports",
                 callback_data="reports",
             ),
         ],
+
         [
             InlineKeyboardButton(
                 "ℹ️ Help",
@@ -306,7 +315,9 @@ async def start(
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
@@ -321,7 +332,7 @@ def save_schedule(
     start_time,
     end_time,
     shift,
-    note=""
+    note="",
 ):
 
     conn = get_db()
@@ -361,14 +372,22 @@ def save_schedule(
 
 
 # ==========================================
-# PARSE TIME
+# TIME PARSER
 # ==========================================
 
 def parse_time(text):
 
     text = text.strip()
 
-    pattern = r"^(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?$"
+    pattern = (
+        r"^"
+        r"(\d{1,2})"
+        r"(?::(\d{2}))?"
+        r"\s*-\s*"
+        r"(\d{1,2})"
+        r"(?::(\d{2}))?"
+        r"$"
+    )
 
     match = re.match(
         pattern,
@@ -399,12 +418,12 @@ def parse_time(text):
 
 
 # ==========================================
-# TEXT SCHEDULE INPUT
+# SCHEDULE TEXT
 # ==========================================
 
 async def handle_schedule_text(
-    update,
-    context,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     if update.effective_chat.type != "private":
@@ -415,9 +434,9 @@ async def handle_schedule_text(
     text = update.message.text.strip()
 
     pattern = (
-        r"^(today|tomorrow)\s+"
-        r"(.+?)\s+"
-        r"(day|night)"
+        r"^(today|tomorrow)"
+        r"\s+(.+?)"
+        r"\s+(day|night)"
         r"(?:\s+(.+))?$"
     )
 
@@ -428,23 +447,27 @@ async def handle_schedule_text(
     )
 
     if not match:
-
         return
 
     day_word = match.group(1).lower()
+
     time_text = match.group(2)
+
     shift = match.group(3).lower()
+
     note = match.group(4) or ""
 
-    parsed = parse_time(time_text)
+    parsed = parse_time(
+        time_text
+    )
 
     if not parsed:
 
         await update.message.reply_text(
             "❌ Time format မမှန်ပါဘူး။\n\n"
             "ဥပမာ:\n"
-            "Today 12:00-15:00 day\n"
-            "Tomorrow 20:00-00:00 night"
+            "Today 12:00-3:00 day\n"
+            "Tomorrow 8:00-12:00 night"
         )
 
         return
@@ -467,17 +490,28 @@ async def handle_schedule_text(
 
         return
 
+    # ======================================
+    # ONE GROUP
+    # ======================================
+
     if len(groups) == 1:
 
         group = groups[0]
 
         target_chat_id = group["chat_id"]
+
         group_title = group["title"]
 
         if day_word == "today":
+
             target_date = date.today()
+
         else:
-            target_date = date.today() + timedelta(days=1)
+
+            target_date = (
+                date.today()
+                + timedelta(days=1)
+            )
 
         save_schedule(
             target_chat_id,
@@ -489,25 +523,41 @@ async def handle_schedule_text(
             note,
         )
 
+        shift_text = (
+            "☀️ Day"
+            if shift == "day"
+            else "🌙 Night"
+        )
+
         await update.message.reply_text(
             "✅ **Schedule Saved**\n\n"
             f"👑 Admin: {user.full_name}\n"
             f"🏠 Group: {group_title}\n"
             f"🗓️ Date: {day_word.title()}\n"
             f"⏰ Time: {start_time} - {end_time}\n"
-            f"{'☀️ Day' if shift == 'day' else '🌙 Night'}\n"
+            f"{shift_text}\n"
             f"📝 Note: {note or '-'}",
             parse_mode="Markdown",
         )
 
         return
 
+    # ======================================
+    # MULTIPLE GROUPS
+    # ======================================
+
     context.user_data["pending_schedule"] = {
+
         "admin_id": user.id,
+
         "day": day_word,
+
         "start_time": start_time,
+
         "end_time": end_time,
+
         "shift": shift,
+
         "note": note,
     }
 
@@ -518,14 +568,19 @@ async def handle_schedule_text(
         buttons.append([
             InlineKeyboardButton(
                 group["title"][:50],
-                callback_data=f"sg:{group['chat_id']}",
+                callback_data=(
+                    f"sg:{group['chat_id']}"
+                ),
             )
         ])
 
     await update.message.reply_text(
-        "🏠 **ဘယ် Group အတွက် Schedule မှတ်မလဲ?**",
+        "🏠 **ဘယ် Group အတွက် "
+        "Schedule မှတ်မလဲ?**",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
     )
 
 
@@ -535,7 +590,7 @@ async def handle_schedule_text(
 
 async def callbacks(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
@@ -544,14 +599,17 @@ async def callbacks(
 
     data = query.data
 
-    # ------------------------------
+    # ======================================
     # SELECT GROUP
-    # ------------------------------
+    # ======================================
 
     if data.startswith("sg:"):
 
         chat_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1,
+            )[1]
         )
 
         pending = context.user_data.get(
@@ -559,9 +617,11 @@ async def callbacks(
         )
 
         if not pending:
+
             await query.edit_message_text(
                 "❌ Schedule session expired."
             )
+
             return
 
         user_id = query.from_user.id
@@ -575,15 +635,18 @@ async def callbacks(
         if not admin:
 
             await query.edit_message_text(
-                "❌ မင်းက ဒီ Group ရဲ့ Admin "
-                "မဟုတ်တော့ပါဘူး။"
+                "❌ မင်းက ဒီ Group ရဲ့ "
+                "Admin မဟုတ်တော့ပါဘူး။"
             )
 
             return
 
         if pending["day"] == "today":
+
             target_date = date.today()
+
         else:
+
             target_date = (
                 date.today()
                 + timedelta(days=1)
@@ -601,11 +664,14 @@ async def callbacks(
 
         conn = get_db()
 
-        row = conn.execute("""
+        row = conn.execute(
+            """
             SELECT title
             FROM groups
             WHERE chat_id = ?
-        """, (chat_id,)).fetchone()
+            """,
+            (chat_id,),
+        ).fetchone()
 
         conn.close()
 
@@ -615,13 +681,19 @@ async def callbacks(
             else "Group"
         )
 
+        shift_text = (
+            "☀️ Day"
+            if pending["shift"] == "day"
+            else "🌙 Night"
+        )
+
         await query.edit_message_text(
             "✅ **Schedule Saved**\n\n"
             f"🏠 Group: {title}\n"
             f"🗓️ {pending['day'].title()}\n"
             f"⏰ {pending['start_time']} - "
             f"{pending['end_time']}\n"
-            f"{'☀️ Day' if pending['shift'] == 'day' else '🌙 Night'}\n"
+            f"{shift_text}\n"
             f"📝 {pending['note'] or '-'}",
             parse_mode="Markdown",
         )
@@ -633,30 +705,31 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # HELP
-    # ------------------------------
+    # ======================================
 
     if data == "help":
 
         await query.edit_message_text(
             "ℹ️ **Help**\n\n"
             "Schedule တင်ရန်:\n\n"
-            "`Today 12:00-15:00 day`\n"
-            "`Tomorrow 20:00-00:00 night`\n\n"
+            "`Today 12:00-3:00 day`\n"
+            "`Tomorrow 8:00-12:00 night`\n\n"
             "🗓️ Today / Tomorrow\n"
             "☀️ Day / 🌙 Night\n"
             "⏰ Start - End Time\n\n"
             "Bot က Telegram Group Admin "
-            "ဟုတ်/မဟုတ် အလိုအလျောက်စစ်ပေးပါတယ်။",
+            "ဟုတ်/မဟုတ် အလိုအလျောက် "
+            "စစ်ပေးပါတယ်။",
             parse_mode="Markdown",
         )
 
         return
 
-    # ------------------------------
+    # ======================================
     # TODAY
-    # ------------------------------
+    # ======================================
 
     if data == "today":
 
@@ -668,9 +741,9 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # TOMORROW
-    # ------------------------------
+    # ======================================
 
     if data == "tomorrow":
 
@@ -683,9 +756,9 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # MY SCHEDULE
-    # ------------------------------
+    # ======================================
 
     if data == "mine":
 
@@ -696,16 +769,16 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # ADMINS
-    # ------------------------------
+    # ======================================
 
     if data == "admins":
 
         await query.edit_message_text(
             "👑 **Admins**\n\n"
-            "Admin status ကို Telegram Group "
-            "ထဲကနေ အလိုအလျောက်စစ်ပါတယ်။\n\n"
+            "Admin status ကို Telegram "
+            "Group ထဲကနေ အလိုအလျောက်စစ်ပါတယ်။\n\n"
             "Admin ဖြစ်/မဖြစ် စမ်းရန်:\n"
             "`/checkadmin`",
             parse_mode="Markdown",
@@ -713,9 +786,9 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # REPORTS
-    # ------------------------------
+    # ======================================
 
     if data == "reports":
 
@@ -727,18 +800,18 @@ async def callbacks(
 
         return
 
-    # ------------------------------
+    # ======================================
     # ADD
-    # ------------------------------
+    # ======================================
 
     if data == "add":
 
         await query.edit_message_text(
             "➕ **Add Schedule**\n\n"
             "Bot ကို DM မှာ ဒီလိုပို့ပါ:\n\n"
-            "`Today 12:00-15:00 day`\n\n"
+            "`Today 12:00-3:00 day`\n\n"
             "သို့မဟုတ်\n\n"
-            "`Tomorrow 20:00-00:00 night`",
+            "`Tomorrow 8:00-12:00 night`",
             parse_mode="Markdown",
         )
 
@@ -776,7 +849,8 @@ async def show_schedule(
     ]
 
     placeholders = ",".join(
-        "?" for _ in chat_ids
+        "?"
+        for _ in chat_ids
     )
 
     conn = get_db()
@@ -788,15 +862,23 @@ async def show_schedule(
             g.title,
             u.full_name
         FROM schedules s
+
         LEFT JOIN groups g
             ON s.chat_id = g.chat_id
+
         LEFT JOIN users u
             ON s.admin_id = u.user_id
+
         WHERE s.chat_id IN ({placeholders})
+
         AND s.schedule_date = ?
+
         ORDER BY s.start_time
         """,
-        (*chat_ids, target_date.isoformat()),
+        (
+            *chat_ids,
+            target_date.isoformat(),
+        ),
     ).fetchall()
 
     conn.close()
@@ -812,7 +894,8 @@ async def show_schedule(
         return
 
     lines = [
-        f"🗓️ **Schedule — {target_date.isoformat()}**\n"
+        f"🗓️ **Schedule — "
+        f"{target_date.isoformat()}**\n"
     ]
 
     for row in rows:
@@ -824,7 +907,8 @@ async def show_schedule(
         )
 
         lines.append(
-            f"{shift_icon} **{row['full_name']}**\n"
+            f"{shift_icon} "
+            f"**{row['full_name']}**\n"
             f"🏠 {row['title']}\n"
             f"⏰ {row['start_time']} - "
             f"{row['end_time']}\n"
@@ -850,22 +934,265 @@ async def show_my_schedule(
 
     conn = get_db()
 
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT
             s.*,
             g.title
         FROM schedules s
+
         LEFT JOIN groups g
             ON s.chat_id = g.chat_id
+
         WHERE s.admin_id = ?
+
         AND s.schedule_date >= ?
+
         ORDER BY
             s.schedule_date,
             s.start_time
+
         LIMIT 20
-    """, (
-        user_id,
-        date.today().isoformat(),
-    )).fetchall()
-    if __name__ == "__main__":
+        """,
+        (
+            user_id,
+            date.today().isoformat(),
+        ),
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        await query.edit_message_text(
+            "📋 **My Schedule**\n\n"
+            "Schedule မရှိသေးပါဘူး။",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    lines = [
+        "📋 **My Schedule**\n"
+    ]
+
+    for row in rows:
+
+        icon = (
+            "☀️"
+            if row["shift"] == "day"
+            else "🌙"
+        )
+
+        lines.append(
+            f"{icon} {row['schedule_date']}\n"
+            f"🏠 {row['title']}\n"
+            f"⏰ {row['start_time']} - "
+            f"{row['end_time']}\n"
+        )
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+# ==========================================
+# /MYID
+# ==========================================
+
+async def myid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    await update.message.reply_text(
+        f"🆔 Your Telegram ID:\n\n"
+        f"`{user.id}`",
+        parse_mode="Markdown",
+    )
+
+
+# ==========================================
+# /GROUPID
+# ==========================================
+
+async def groupid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
+        await update.message.reply_text(
+            "ဒီ command ကို Group ထဲမှာသုံးပါ။"
+        )
+
+        return
+
+    register_group(
+        chat.id,
+        chat.title,
+    )
+
+    await update.message.reply_text(
+        f"🆔 Group ID:\n\n"
+        f"`{chat.id}`\n\n"
+        f"📌 Group Name:\n"
+        f"{chat.title}",
+        parse_mode="Markdown",
+    )
+
+
+# ==========================================
+# /CHECKADMIN
+# ==========================================
+
+async def checkadmin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    user = update.effective_user
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
+        await update.message.reply_text(
+            "ဒီ command ကို Group ထဲမှာသုံးပါ။"
+        )
+
+        return
+
+    admin = await is_group_admin(
+        context,
+        chat.id,
+        user.id,
+    )
+
+    if admin:
+
+        register_group(
+            chat.id,
+            chat.title,
+        )
+
+        await update.message.reply_text(
+            "✅ မင်းက ဒီ Group ရဲ့ "
+            "Admin ဖြစ်ပါတယ်။"
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ မင်းက ဒီ Group ရဲ့ "
+            "Admin မဟုတ်ပါဘူး။"
+        )
+
+
+# ==========================================
+# ERROR HANDLER
+# ==========================================
+
+async def error_handler(
+    update,
+    context,
+):
+
+    logger.error(
+        "Update error: %s",
+        context.error,
+    )
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+def main():
+
+    if not TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN is missing."
+        )
+
+    init_db()
+
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "myid",
+            myid,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "groupid",
+            groupid,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "checkadmin",
+            checkadmin,
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            callbacks
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            handle_schedule_text,
+        )
+    )
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    print(
+        "🤖 Group Admin Management Bot is running...",
+        flush=True,
+    )
+
+    app.run_polling()
+
+
+# ==========================================
+# START BOT
+# ==========================================
+
+if __name__ == "__main__":
     main()
