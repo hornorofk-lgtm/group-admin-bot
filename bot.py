@@ -18,6 +18,8 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # =========================================================
@@ -283,7 +285,12 @@ async def is_admin(update, user_id=None):
         return False
 
     if user_id is None:
-        user_id = update.effective_user.id
+        user = update.effective_user
+
+        if not user:
+            return False
+
+        user_id = user.id
 
     try:
         member = await chat.get_member(user_id)
@@ -327,21 +334,16 @@ def convert_time(hour, minute, shift):
 
     shift = shift.lower()
 
-    # DAY
     if shift == "day":
 
-        # 1:00 -> 13:00
         if hour < 8:
             hour += 12
 
-    # NIGHT
     elif shift == "night":
 
-        # 8:00 -> 20:00
         if 1 <= hour <= 11:
             hour += 12
 
-        # 12:00 -> 00:00
         elif hour == 12:
             hour = 0
 
@@ -594,9 +596,7 @@ async def send_notification(
     )
 
     if row["note"]:
-        text += (
-            f"\n📝 {row['note']}"
-        )
+        text += f"\n📝 {row['note']}"
 
     try:
 
@@ -657,7 +657,7 @@ async def end_job(context):
 
 
 # =========================================================
-# RESTORE JOBS AFTER RESTART
+# RESTORE JOBS
 # =========================================================
 
 async def restore_jobs(app):
@@ -684,6 +684,151 @@ async def restore_jobs(app):
     logger.info(
         "Restored %s schedule(s).",
         len(rows),
+    )
+
+
+# =========================================================
+# ADD SCHEDULE CORE
+# =========================================================
+
+async def add_schedule_from_text(
+    update,
+    context,
+    schedule_text,
+):
+
+    try:
+
+        start_dt, end_dt, shift, note = (
+            parse_schedule(schedule_text)
+        )
+
+    except ValueError as e:
+
+        await update.effective_message.reply_text(
+            f"❌ {e}"
+        )
+
+        return
+
+    save_user(
+        update.effective_user
+    )
+
+    save_group(
+        update.effective_chat
+    )
+
+    conn = get_db()
+
+    cursor = conn.execute("""
+        INSERT INTO schedules
+        (
+            chat_id,
+            user_id,
+            start_at,
+            end_at,
+            shift,
+            note,
+            created_at
+        )
+
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        update.effective_chat.id,
+        update.effective_user.id,
+        to_iso(start_dt),
+        to_iso(end_dt),
+        shift,
+        note,
+        to_iso(now()),
+    ))
+
+    schedule_id = cursor.lastrowid
+
+    conn.commit()
+
+    row = conn.execute("""
+        SELECT *
+        FROM schedules
+        WHERE id = ?
+    """, (
+        schedule_id,
+    )).fetchone()
+
+    conn.close()
+
+    create_schedule_jobs(
+        context.application,
+        row,
+    )
+
+    text = (
+        "╔══ ✦ SCHEDULE ADDED ✦ ══╗\n\n"
+        f"🆔 <b>#{schedule_id}</b>\n"
+        f"🕐 <b>{start_dt.strftime('%I:%M %p')} "
+        f"– {end_dt.strftime('%I:%M %p')}</b>\n"
+        f"🌙 {shift.upper()}\n"
+        f"👤 {update.effective_user.full_name}\n"
+    )
+
+    if note:
+        text += f"📝 {note}\n"
+
+    text += (
+        f"\n⏰ Reminder: "
+        f"{REMINDER_MINUTES} minutes before"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# RAW TEXT SCHEDULE HANDLER
+# =========================================================
+
+async def schedule_text_handler(
+    update,
+    context,
+):
+
+    message = update.effective_message
+
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+
+    # Ignore commands
+    if text.startswith("/"):
+        return
+
+    # Only Group / Supergroup
+    if update.effective_chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        return
+
+    # Only admins
+    if not await is_admin(update):
+        return
+
+    # Only process Today / Tomorrow
+    if not re.match(
+        r"^(today|tomorrow)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return
+
+    await add_schedule_from_text(
+        update,
+        context,
+        text,
     )
 
 
@@ -722,7 +867,7 @@ async def start_command(
 
 
 # =========================================================
-# TODAY
+# TODAY / TOMORROW
 # =========================================================
 
 async def show_day(
@@ -879,7 +1024,7 @@ async def tomorrow_command(
 
 
 # =========================================================
-# ADD SCHEDULE
+# ADD SCHEDULE COMMAND
 # =========================================================
 
 async def schedule_command(
@@ -908,93 +1053,10 @@ async def schedule_command(
         context.args
     )
 
-    try:
-
-        start_dt, end_dt, shift, note = (
-            parse_schedule(schedule_text)
-        )
-
-    except ValueError as e:
-
-        await update.message.reply_text(
-            f"❌ {e}"
-        )
-
-        return
-
-    save_user(
-        update.effective_user
-    )
-
-    save_group(
-        update.effective_chat
-    )
-
-    conn = get_db()
-
-    cursor = conn.execute("""
-        INSERT INTO schedules
-        (
-            chat_id,
-            user_id,
-            start_at,
-            end_at,
-            shift,
-            note,
-            created_at
-        )
-
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        update.effective_chat.id,
-        update.effective_user.id,
-        to_iso(start_dt),
-        to_iso(end_dt),
-        shift,
-        note,
-        to_iso(now()),
-    ))
-
-    schedule_id = cursor.lastrowid
-
-    conn.commit()
-
-    row = conn.execute("""
-        SELECT *
-        FROM schedules
-        WHERE id = ?
-    """, (
-        schedule_id,
-    )).fetchone()
-
-    conn.close()
-
-    create_schedule_jobs(
-        context.application,
-        row,
-    )
-
-    text = (
-        "╔══ ✦ SCHEDULE ADDED ✦ ══╗\n\n"
-        f"🕐 <b>{start_dt.strftime('%I:%M %p')} "
-        f"– {end_dt.strftime('%I:%M %p')}</b>\n"
-        f"🌙 {shift.upper()}\n"
-        f"👤 {update.effective_user.full_name}\n"
-    )
-
-    if note:
-        text += (
-            f"📝 {note}\n"
-        )
-
-    text += (
-        "\n⏰ Reminder: "
-        f"{REMINDER_MINUTES} minutes before"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
+    await add_schedule_from_text(
+        update,
+        context,
+        schedule_text,
     )
 
 
@@ -1235,6 +1297,7 @@ async def cancel_schedule_command(
         schedule_id = int(
             context.args[0]
         )
+
     except ValueError:
 
         await update.message.reply_text(
@@ -1311,6 +1374,7 @@ async def add_admin_command(
         user_id = int(
             context.args[0]
         )
+
     except ValueError:
 
         await update.message.reply_text(
@@ -1363,6 +1427,7 @@ async def remove_admin_command(
         user_id = int(
             context.args[0]
         )
+
     except ValueError:
 
         await update.message.reply_text(
@@ -1477,14 +1542,10 @@ async def broadcast_command(
     targets = set()
 
     for row in users:
-        targets.add(
-            row["user_id"]
-        )
+        targets.add(row["user_id"])
 
     for row in groups:
-        targets.add(
-            row["chat_id"]
-        )
+        targets.add(row["chat_id"])
 
     sent = 0
     failed = 0
@@ -1560,8 +1621,6 @@ async def button_handler(
         return
 
     if data == "my_schedule":
-
-        rows = []
 
         conn = get_db()
 
@@ -1943,7 +2002,10 @@ def main():
 
     current_application = application
 
-    # Commands
+    # =====================================================
+    # COMMANDS
+    # =====================================================
+
     application.add_handler(
         CommandHandler(
             "start",
@@ -2035,14 +2097,31 @@ def main():
         )
     )
 
-    # Buttons
+    # =====================================================
+    # RAW TEXT SCHEDULE
+    # =====================================================
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            schedule_text_handler,
+        )
+    )
+
+    # =====================================================
+    # BUTTONS
+    # =====================================================
+
     application.add_handler(
         CallbackQueryHandler(
             button_handler
         )
     )
 
-    # Member tracking
+    # =====================================================
+    # MEMBER TRACKING
+    # =====================================================
+
     application.add_handler(
         ChatMemberHandler(
             member_update,
