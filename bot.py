@@ -867,5 +867,5 @@ async def show_my_schedule(
         user_id,
         date.today().isoformat(),
     )).fetchall()
-        if __name__ == "__main__":
+    if __name__ == "__main__":
     main()
